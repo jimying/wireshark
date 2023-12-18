@@ -38,6 +38,8 @@ static int hf_h265_start_bit;
 static int hf_h265_end_bit;
 static int hf_h265_rbsp_stop_bit;
 static int hf_h265_rbsp_trailing_bits;
+/* Packetization Values */
+static int hf_h265_nalu_size = -1;
 
 /* SDP */
 static int hf_h265_sdp_parameter_sprop_vps;
@@ -393,6 +395,7 @@ static expert_field ei_h265_undecoded;
 static expert_field ei_h265_format_specific_parameter;
 static expert_field ei_h265_oversized_exp_golomb_code;
 static expert_field ei_h265_value_to_large;
+static expert_field ei_h265_bad_nal_length;
 
 static dissector_handle_t h265_handle;
 
@@ -2897,6 +2900,42 @@ dissect_h265_unescap_nal_unit(tvbuff_t *tvb, packet_info *pinfo, int offset)
 	return tvb_rbsp;
 }
 
+ /* Section 4.4.2  Aggregation Packets (APs) */
+static void
+dissect_h265_aps(proto_tree *tree, tvbuff_t *tvb, packet_info *pinfo, gint offset)
+{
+	guint16 nal_unit_size;
+	tvbuff_t *nalu_tvb;
+	proto_item *item;
+
+	while (tvb_reported_length_remaining(tvb, offset) > 0)
+	{
+		/* Get the size of the NAL unit and display */
+		proto_tree_add_item(tree, hf_h265_nalu_size, tvb, offset, 2, ENC_BIG_ENDIAN);
+		nal_unit_size = tvb_get_ntohs(tvb, offset);
+		offset += 2;
+
+		/* Do a sanity check on the unit size versus what is left in the packet. */
+		if (nal_unit_size == 0 || tvb_reported_length_remaining(tvb, offset) < nal_unit_size)
+		{
+			/* Throw an exception if the size is wrong and don't try to decode the rest of the packet. */
+			col_append_fstr(pinfo->cinfo, COL_INFO, "  [Bad NAL Length]");
+			item = proto_tree_add_expert(tree, pinfo, &ei_h265_bad_nal_length, tvb, offset - 2, 2);
+			proto_item_append_text(item, " Size of %d, Remaining %d",
+								   nal_unit_size, tvb_reported_length_remaining(tvb, offset));
+			offset += tvb_reported_length_remaining(tvb, offset);
+		}
+		else
+		{
+			/* Make a new subset of the existing buffer for the NAL unit */
+			nalu_tvb = tvb_new_subset_length_caplen(tvb, offset, tvb_captured_length_remaining(tvb, offset), nal_unit_size);
+			/* Decode the NAL unit */
+			dissect_h265(nalu_tvb, pinfo, tree, NULL);
+			offset += nal_unit_size;
+		}
+	}
+}
+
 void
 dissect_h265_format_specific_parameter(proto_tree *tree, tvbuff_t *tvb, packet_info *pinfo)
 {
@@ -3066,6 +3105,9 @@ dissect_h265(tvbuff_t *tvb, packet_info *pinfo, proto_tree *tree, void* data _U_
 		case 40:  /*SUFFIX_SEI_NUT - Supplemental enhancement information*/
 			dissect_h265_sei_rbsp(stream_tree, rbsp_tvb, pinfo, 0, type);
 			break;
+		case 48:  /* Aggregation Packets (APs) */
+			dissect_h265_aps(stream_tree, tvb, pinfo, offset);
+			break;
 
 		case 49:       /* FU - Fragmentation Units */
 			break;
@@ -3186,6 +3228,14 @@ proto_register_h265(void)
 		FT_UINT8, BASE_DEC, NULL, 0x0,
 		NULL, HFILL }
 		},
+
+		/* Packization Values */
+		{ &hf_h265_nalu_size,
+		{ "NAL Unit Size", "h265.nalu_size",
+		FT_UINT16, BASE_DEC, NULL, 0x0,
+		NULL, HFILL }
+		},
+
 		/*VPS*/
 		{ &hf_h265_vps_video_parameter_set_id,
 		{ "vps_video_parameter_set_id", "h265.vps_video_parameter_set_id",
@@ -4736,6 +4786,7 @@ proto_register_h265(void)
 		{ &ei_h265_oversized_exp_golomb_code, {"h265.oversized_exp_golomb_code", PI_MALFORMED, PI_ERROR, "Exponential Golomb encoded value greater than 32 bit integer, clamped", EXPFILL } },
 		{ &ei_h265_value_to_large,{ "h265.value_to_large", PI_PROTOCOL, PI_ERROR, "[Value to large, protocol violation]", EXPFILL } },
 		{ &ei_h265_format_specific_parameter,{ "h265.format_specific_parameter", PI_UNDECODED, PI_WARN, "[Unspecified media format specific parameter]", EXPFILL } },
+		{ &ei_h265_bad_nal_length, { "h265.bad_nalu_length", PI_MALFORMED, PI_ERROR, "[Bad NAL Unit Length]", EXPFILL }},
 	};
 
 	/* Register the protocol name and description */
